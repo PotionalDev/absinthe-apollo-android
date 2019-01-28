@@ -1,6 +1,5 @@
 package com.potional.absinthechannelssubscriptiontransport.library
 
-import android.util.Log
 import com.apollographql.apollo.subscription.OperationClientMessage
 import com.apollographql.apollo.subscription.OperationServerMessage
 import com.apollographql.apollo.subscription.SubscriptionTransport
@@ -15,8 +14,8 @@ class AbsintheChannelsSubscriptionTransport(
     params: Map<String, Any>
 ) : SubscriptionTransport {
 
-    val socket = PhxSocket(webSocketUrl, params)
-    val channel = socket.channel(ABSINTHE_CHANNEL_TOPIC)
+    private val socket = PhxSocket(webSocketUrl, params)
+    private val channel = socket.channel(ABSINTHE_CHANNEL_TOPIC)
     private val activeSubscriptions = mutableMapOf<String, String>()
 
     override fun disconnect(message: OperationClientMessage?) {
@@ -26,7 +25,9 @@ class AbsintheChannelsSubscriptionTransport(
 
     override fun connect() {
         socket.connect()
-        socket.onOpen(this::onSocketOpen)
+        socket.onOpen {
+            callback.onConnected()
+        }
         socket.onMessage(this::onAbsintheMessage)
     }
 
@@ -41,16 +42,16 @@ class AbsintheChannelsSubscriptionTransport(
         return OperationServerMessage.Data(subscriptionId, message.payload["result"] as Map<String, Any>)
     }
 
-    private fun onSocketOpen() {
+    private fun joinControlChannel() {
         channel
             .join()
             .receive("ok") {
-                emitApolloAck()
+                callback.onMessage(OperationServerMessage.ConnectionAcknowledge())
             }
-    }
+            .receive("error") {
+                callback.onMessage(OperationServerMessage.ConnectionError(it.payload))
+            }
 
-    private fun emitApolloAck() {
-        callback.onMessage(OperationServerMessage.ConnectionAcknowledge())
     }
 
     private fun getSubscriptionApolloId(absintheSubscriptionId: String): String? {
@@ -59,7 +60,7 @@ class AbsintheChannelsSubscriptionTransport(
 
     override fun send(message: OperationClientMessage?) {
         when (message) {
-            is OperationClientMessage.Init -> Log.d("INIT", "INIT__________________")
+            is OperationClientMessage.Init -> joinControlChannel()
             is OperationClientMessage.Start -> sendSubscriptionStartMessage(message)
             is OperationClientMessage.Stop -> sendUnsubscriptionStopMessage(message)
             is OperationClientMessage.Terminate -> disconnect(message)
@@ -78,12 +79,23 @@ class AbsintheChannelsSubscriptionTransport(
     private fun sendUnsubscriptionStopMessage(message: OperationClientMessage.Stop) {
         val subscriptionId = getSubscriptionApolloId(message.subscriptionId)
         if (subscriptionId != null) {
-            channel.push("unsubscribe", mapOf(
-                "subscriptionId" to activeSubscriptions[subscriptionId] as Any
-            )).receive("stop") {
-                //TODO
+            channel.push(
+                "unsubscribe", mapOf(
+                    "subscriptionId" to activeSubscriptions[subscriptionId] as Any
+                )
+            ).receive("ok") {
+                removeSubscriptionFromActive(message.subscriptionId)
+                emitOperationComplete(subscriptionId)
             }
         }
+    }
+
+    private fun removeSubscriptionFromActive(subscriptionId: String) {
+        activeSubscriptions.remove(subscriptionId)
+    }
+
+    private fun emitOperationComplete(subscriptionId: String) {
+        callback.onMessage(OperationServerMessage.Complete(subscriptionId))
     }
 
     private fun apolloMessageToAbsintheData(message: OperationClientMessage.Start): Map<String, Any> {
@@ -92,14 +104,10 @@ class AbsintheChannelsSubscriptionTransport(
         )
     }
 
-    private fun unsubscribe(message: OperationClientMessage.Stop) {
-        activeSubscriptions.remove(message.subscriptionId)
-    }
-
     class Factory(
         private val webSocketUrl: String,
         private val params: Map<String, Any> = mapOf()
-    ): SubscriptionTransport.Factory {
+    ) : SubscriptionTransport.Factory {
 
         override fun create(callback: SubscriptionTransport.Callback): SubscriptionTransport {
             return AbsintheChannelsSubscriptionTransport(webSocketUrl, callback, params)
